@@ -1,0 +1,691 @@
+---
+title: "Project D - Predicting Flight Delays"
+author: "Manish Walia, Priyanka Karia, Mohit Gattani, Akshita Garg"
+date: 'December 01, 2017'
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    theme: cerulean
+    highlight: tango
+---
+
+### Preamble: Loading packages and data
+
+```{r, message=FALSE,warning=FALSE}
+library(ggplot2)
+library(ISLR)
+library(MASS)
+library(partykit)
+library(caret)
+library(rpart)
+library(randomForest)
+library(pROC)
+library(plyr)
+library(dplyr)
+library(knitr)
+library(glmnet)
+library(openxlsx)
+library(gam)
+```
+
+
+### 0. Read Data
+```{r, cache = TRUE}
+# Read the flight delay data for Pittsburgh for the year 2006
+
+flight.delay <- read.csv("http://www.andrew.cmu.edu/user/achoulde/95791/projects/Project%20D/all_PIT_2006.csv",header = TRUE, sep = ",")
+
+```
+
+### 1. Variable Selection : Based on Redundant information
+```{r, cache = TRUE}
+
+flight.delay <- flight.delay %>% dplyr :: select(-c(AirlineID, Carrier, Flights, ArrDel15, ArrDel30, ArrDelSys15, ArrDelSys30, ArrTimeBlk, DepDel30, DepDelSys15, DepDelSys30, DepTimeBlk, OriginCityName, OriginStateFips, OriginStateName, OriginState, DestCityName, DestState, DestStateFips, DestStateName, DestWac, WheelsOff, WheelsOn, Year, Quarter, DayofMonth, OriginWac, Cancelled))
+```
+**In the given data, many fields were present which were either redundant or were derived from another field.</br>**
+
+**- AirlineID, Carrier and UniquCarrier denoted the same information so we kept UniqueCarrier and removed the other two fields.</br>**
+**- There were many fields that contained origin and destination information such as Origin/Dest, OriginCityName/DestCityName, OriginStateName/DestStateName, OriginState/DestState, OriginWac/DestWac. We decided to include only the Origin and Dest fields which contains the city codes. </br>**
+**- There were many derived fields that were derived from ArrDelay and DepDelay fields such as ArrDel15, ArrDel30, ArrDelSys15, ArrDelSys30, ArrTimeBlk, DepDel30, DepDelSys15, DepDelSys30, DepTimeBlk. </br>**
+**- Year, Quarter, DayofMonth are derived from the FlightDate field. </br>**
+**- Cancelled and CancellationCode indicated the same information. So, we excluded the Cancelled field. </br>**
+**- WheelsOff and WheelsOn are dervied from the DepTime/ArrTime and TaxiOut/TaxiIn fields. </br></br>**
+**Hence, these fields were excluded from our analysis.**
+
+### 2. Creating Summary of data
+```{r, message=FALSE, warning=FALSE, cache = TRUE}
+field.summary <- function(df)
+{
+
+#Finding column names
+field.name <- data.frame(colnames = colnames(df, do.NULL = TRUE, prefix = "col"))
+
+#Finding class type
+data.type <- data.frame(lapply(df, class))
+data.type <- as.data.frame(t(data.type))
+field.name <- mutate(field.name, dataType = data.type$V1)
+
+#Finding factors
+factor.level <- data.frame(factorLevels = sapply(df[], nlevels))
+field.name <- mutate(field.name, factorLevels = factor.level$factorLevels)
+
+#Finding mean
+mean <-  data.frame(mean = ifelse(sapply(df, is.numeric), lapply(df, mean, na.rm = T), 0))
+mean <- as.data.frame(t(mean))
+field.name <- mutate(field.name, mean = mean$V1)
+
+#Finding sd
+sd <-  data.frame(sd = ifelse(sapply(df, is.numeric), lapply(df, sd, na.rm = T), 0))
+sd <- as.data.frame(t(sd))
+field.name <- mutate(field.name, sd = sd$V1)
+
+#Finding missing values
+missing.value <- data.frame(missingValues = colSums(is.na(df)))
+field.name <- mutate(field.name, missingValues = missing.value$missingValues)
+
+return(field.name)
+
+}
+summary <- field.summary(flight.delay)
+
+#Printing Summary
+kable(summary)
+```
+
+- **The above function is used to depict a summary of the available data. It shows us the column names, datatypes, mean and standard deviation of each field and also indicates how many fields have missing values and their count.**
+
+
+### 3. Filling missing data
+```{r, message=FALSE, warning=FALSE, cache = TRUE}
+
+#Filling ActualElapsedTime with CRSElapsedTime
+flight.delay$ActualElapsedTime <- ifelse(is.na(flight.delay$ActualElapsedTime) == "TRUE", flight.delay$CRSElapsedTime, flight.delay$ActualElapsedTime)
+
+#Filling ArrTime with CRSArrTime
+flight.delay$ArrTime <- ifelse(is.na(flight.delay$ArrTime) == "TRUE", flight.delay$CRSArrTime, flight.delay$ArrTime)
+
+#Filling DepTime with CRSDepTime
+flight.delay$DepTime <- ifelse(is.na(flight.delay$DepTime) == "TRUE", flight.delay$CRSDepTime, flight.delay$DepTime)
+
+#Filling ArrDelay with 0
+flight.delay$ArrDelay <- ifelse(is.na(flight.delay$ArrDelay) == "TRUE" | flight.delay$ArrDelay < 0, 0, flight.delay$ArrDelay)
+
+#Filling DepDelay with 0
+flight.delay$DepDelay <- ifelse(is.na(flight.delay$DepDelay) == "TRUE" | flight.delay$DepDelay < 0, 0, flight.delay$DepDelay)
+
+#Filling AirTime with 0
+flight.delay$AirTime <- ifelse(is.na(flight.delay$AirTime) == "TRUE",0,flight.delay$AirTime)
+
+summary <- field.summary(flight.delay)
+
+#Printing Summary
+kable(summary)
+
+```
+
+- **Based on the information we got from the summary function, we replaced the missing data in the above fields accordingly. **
+
+
+### 4. Visualising Data and Extracting Insights
+```{r, cache = TRUE}
+
+#Summarizing departure delay with respect to origin
+flight.delay.visual.dest.pit <- subset(flight.delay, Dest == "PIT")
+
+flight.depdelay.origin <- dplyr ::summarise(group_by(flight.delay.visual.dest.pit, Origin), DepDelay = mean(DepDelay))
+
+# Extracting top 10 origin delays
+flight.depdelay.origin.top.10 <- flight.depdelay.origin %>%filter(rank(desc(DepDelay))<=10)
+
+#Plotting top 10 delays 
+ggplot (data = flight.depdelay.origin.top.10, mapping = aes(x = Origin, y = DepDelay)) + geom_bar(stat = "identity", fill = "#FF6666") + labs(x = "Origin City",y = "Mean delay at departure (in minutes)", title = "Mean departure delay for cities (Top 10)")
+```
+
+- **The above graph shows that the flights arriving in Pittsburgh from other origin cities and their mean departure delay for the year 2006. This shows that the maximum flights coming from Seattle are delayed and the mean time of flights delayed for the same are 40 minutes. On the other hand, the mean flights delayed from Detroit(DTW) where the mean time of flights delayed are 12 minutes.**
+
+```{r, warning=FALSE, cache = TRUE}
+
+# Total Flights departing from Pittsburgh with and without Delay for each carrier
+flight.delay.visual.pit <- subset(flight.delay, Origin == "PIT")
+
+flight.delay.visual.pit$DepDel15 <- as.factor(flight.delay.visual.pit$DepDel15)
+ggplot(flight.delay.visual.pit, aes (x = UniqueCarrier)) + geom_histogram(aes(fill = DepDel15), stat = "count") + labs( y = "Number of flights", title = "Number of flights departing from Pittsburgh for each carrier")
+```
+
+- **The above graph shows that the number of flights departing from Pittsburgh and the Departure Delay of more than 15 minutes. For example, the maximum flights are delayed by US carrier i.e. around 5000 flights. However, the number of flights are also around 32000 for this airline. This shows only around 15% of the flights are delayed. However, the same is around 17% for WN carrier. This percentage delay is around 21% for MQ carrier. This shows that the maximum delayed flights are for MQ carrier.**
+
+
+```{r, fig.height = 6, fig.width = 10, cache = TRUE}
+
+#Percentage of flights delayed based on distance group
+
+flight.delay.visual.pit$DepDel15 <- as.factor(flight.delay.visual.pit$DepDel15)
+df1 <- ddply(flight.delay.visual.pit, .(DistanceGroup), nrow)
+df2 <- ddply(flight.delay.visual.pit, .(DistanceGroup, DepDel15), nrow)
+df2 <- df2[df2$DepDel15 == 1,]
+delay.count.distGroup <- data.frame(cbind(DistanceGroup = df1$DistanceGroup, Total_Flights = df1$V1, Flights_Delayed = df2$V1, Percent_Flight_Delayed = df2$V1/df1$V1*100))
+
+ggplot(delay.count.distGroup) + 
+  geom_line(aes(x = delay.count.distGroup$DistanceGroup, y = delay.count.distGroup$Percent_Flight_Delayed)) + 
+  geom_point(aes(x = delay.count.distGroup$DistanceGroup, y = delay.count.distGroup$Percent_Flight_Delayed)) +
+  scale_x_continuous(breaks=c(1:10), labels=c("0-250","250-500","500-750","750-1000","1000-1250","1250-1500","1500-1750","1750-2000","2000-2250","2250-2500")) +
+  xlab("Distance in Miles") + ylab("% of Flights Delayed")
+
+```
+
+- **The above graph shows that the distance and percentage of flights delayed are not correlated. Our assumption was that more the distance is the more the delay would be. However, there is no co-relation between the distance group and the percentage of flights delayed. Also, the above plot shows that the maximum delay is for the distance 250-500. And the least percentage of flights delayed is for the distance 1500-1750. This might be possible because of the more number of flights for short distances like for 250-500. And it is least for 1500-1750 because of less number of flights travelling for this distance.**
+
+```{r}
+
+#Mean delay time by day of Week
+arr.delay.mean.dayOfWeek <- ddply( flight.delay.visual.pit, .(DayOfWeek), function(x) mean(x$ArrDelay) )
+dep.delay.mean.dayOfWeek <- ddply( flight.delay.visual.pit, .(DayOfWeek), function(x) mean(x$DepDelay) )
+mean.delay.dayOfWeek <- data.frame(cbind(DayOfWeek = arr.delay.mean.dayOfWeek$DayOfWeek, Mean_Arr_Delay =  arr.delay.mean.dayOfWeek$V1, Mean_Dep_Delay = dep.delay.mean.dayOfWeek$V1))
+
+ggplot(mean.delay.dayOfWeek) + geom_line(aes(x = mean.delay.dayOfWeek$DayOfWeek, y = mean.delay.dayOfWeek$Mean_Arr_Delay), color = "Blue" , size=2) + 
+  geom_point(aes(x = mean.delay.dayOfWeek$DayOfWeek, y = mean.delay.dayOfWeek$Mean_Arr_Delay), size=3) + 
+  geom_line(aes(x = mean.delay.dayOfWeek$DayOfWeek, y = mean.delay.dayOfWeek$Mean_Dep_Delay), color = "Red", size=2) + 
+  geom_point(aes(x = mean.delay.dayOfWeek$DayOfWeek, y = mean.delay.dayOfWeek$Mean_Dep_Delay), size=3) + 
+  scale_x_continuous(breaks=c(1:7), labels=c("Mon","Tue","Wed","Thu","Fri","Sat","Sun")) +
+  xlab("Day of Week") + ylab("Mean Delay Time (in minutes)") + 
+  annotate("text", x = 5, y=18, label = "Mean Delay in Arrival", color = "Blue" , size = 5) +
+  annotate("text", x = 5, y=10, label = "Mean Delay in Departure", color = "Red", size = 5) +
+  annotate("text", x = 4, y=19, label = "Mean delay time by Day of the week", color = "Black", size = 8)
+```
+
+- **The above graph shows the variation of Mean Delay Time and Days of Week. This shows that the maximum flights delayed are on Friday. This is directly related to the assumption that maximum people travel on Friday and the time taken by airline to board more number of passengers might be more. Also, there might be more number of flights running on Friday which might cause more congestion on airport as well as air conjestion. Hence, the flights are more delayed on Friday.**
+
+```{r, cache = TRUE}
+
+#Adding Time of the day columns
+dep.time.of.day <- vector()
+arr.time.of.day <- vector()
+
+for(i in 1:nrow(flight.delay.visual.pit))
+{
+  if(flight.delay.visual.pit$DepTime[i] >= 400 && flight.delay.visual.pit$DepTime[i] < 1000)
+  {
+    dep.time.of.day[i] <- "morning"
+  } else if(flight.delay.visual.pit$DepTime[i] >= 1000 && flight.delay.visual.pit$DepTime[i] < 1600)
+  {
+    dep.time.of.day[i] <- "afternoon"
+  } else if(flight.delay.visual.pit$DepTime[i] >= 1600 && flight.delay.visual.pit$DepTime[i] < 2200)
+  {
+    dep.time.of.day[i] <- "evening"
+  } else if((flight.delay.visual.pit$DepTime[i] >= 2200 && flight.delay.visual.pit$DepTime[i] <= 2400) | (flight.delay.visual.pit$DepTime[i] >= 0000 && flight.delay.visual.pit$DepTime[i] < 400))
+  {
+    dep.time.of.day[i] <- "night"
+  }
+  if(flight.delay.visual.pit$ArrTime[i] >= 400 && flight.delay.visual.pit$ArrTime[i] < 1000)
+  {
+    arr.time.of.day[i] <- "morning"
+  } else if(flight.delay.visual.pit$ArrTime[i] >= 1000 && flight.delay.visual.pit$ArrTime[i] < 1600)
+  {
+    arr.time.of.day[i] <- "afternoon"
+  } else if(flight.delay.visual.pit$ArrTime[i] >= 1600 && flight.delay.visual.pit$ArrTime[i] < 2200)
+  {
+    arr.time.of.day[i] <- "evening"
+  } else if((flight.delay.visual.pit$DepTime[i] >= 2200 && flight.delay.visual.pit$DepTime[i] <= 2400) | (flight.delay.visual.pit$DepTime[i] >= 0000 && flight.delay.visual.pit$DepTime[i] < 400))
+  {
+    arr.time.of.day[i] <- "night"
+  }
+}
+
+flight.delay.visual.x <- data.frame(flight.delay.visual.pit, dep.time.of.day, arr.time.of.day)
+
+flight.delay.visual.x$DepDel15 <- as.factor(flight.delay.visual.x$DepDel15)
+
+flight.delay.visual.x$arr.time.of.day <- factor(flight.delay.visual.x$arr.time.of.day, levels = c("morning", "afternoon", "evening", "night"))
+
+flight.delay.visual.x$dep.time.of.day <- factor(flight.delay.visual.x$dep.time.of.day, levels = c("morning", "afternoon", "evening", "night"))
+
+ggplot(flight.delay.visual.x, aes(dep.time.of.day, ..count..)) + geom_bar(aes(fill = DepDel15), position = "dodge") + labs(x = "Depature time of Day", y = "Number of flights", title = "Flights departing from Pittsburgh vs Time of day")
+
+```
+
+- **The above graph plots the departure time of day versus the number of flights for more than 15 minutes delayed flights and less than 15 minutes delayed flights. The graph shows that the maximum flights are delayed in evening i.e. around 4500 flights which might be because of the fact that people leave for their destinations in the evening after office. Also, a surprising insight is that flights running in night i.e. from 10 pm till 4 am from Pittsburgh are all delayed. This is firstly because there are less flights running at night. Also, this might be because flights are getting delayed since morning till evening which is causing the flights at night to be delayed.**
+
+# 5. Feature Engineering
+```{r, cache=TRUE}
+
+flight.delay <- arrange(flight.delay, FlightDate, TailNum, FlightNum)
+
+flight.delay.pit <- flight.delay %>% mutate(id = ifelse(Origin=="PIT", 2, 1))
+flight.delay.pit <- arrange(flight.delay.pit, FlightDate, TailNum, Origin, Dest, id, DepDelay)
+
+flight.delay.pit.1 <- subset(flight.delay.pit, flight.delay.pit$id == 1)
+
+flight.delay.pit.2 <- subset(flight.delay.pit, flight.delay.pit$id == 2)
+
+flight.combine.data <- left_join (flight.delay.pit.1, flight.delay.pit.2, by = c("TailNum","FlightDate"))
+
+#Combining Data
+flight.combine.data <- select(flight.combine.data, 1:30, DepDelay.y, DepDel15.y )
+
+#Renaming columns
+names(flight.combine.data) <- sub(".x$", "", names(flight.combine.data))
+
+flight.delay.final <- flight.combine.data
+
+#flight.delay.final$DepDelay.y <- ifelse(flight.delay.final$DepDelay.y < 0, 0, flight.delay.final$DepDelay.y)
+
+#Filling DepDel15.y and DepDelay.y with 0
+flight.delay.final$DepDel15.y <- ifelse(is.na(flight.delay.final$DepDel15.y) == "TRUE",0,flight.delay.final$DepDel15.y)
+flight.delay.final$DepDelay.y <- ifelse(is.na(flight.delay.final$DepDelay.y) == "TRUE" | flight.delay.final$DepDelay.y < 0, 0,flight.delay.final$DepDelay.y)
+
+```
+
+- **Currently, we have flight delay data from origin to Pittsburgh airport and from Pittsburgh airport to other destinations. We need to analyze the delay from Pittsburgh airport. We also need to have a row which shows a whole trip i.e. flights arriving to Pittsburgh and flights departing from Pittsburgh. This row will show the round trip or the trip from origin to Pittsburgh and from Pittsburgh to other destination with DepDel15 shown for the flights from Pittsburgh to other destination and DepDel(in minutes) shown for Origin to Pittsburgh.**
+
+- **The notion behind our analysis is a flight delayed from Pittsburgh might be because the flight was delayed from the origin airport or because of reasons from origin airport like LateAircraft delay, NASDelay and other delay factors. These delay factors are estimated when the flight has been reached to Pittsburgh from the origin airport. Hence, we have taken these factors for the origin to Pittsbirgh airport.**
+
+- **Therefore, we will be predicting DepDel15 for Pittsburgh to destination airport using other variables.**
+
+**The feature engineering done on the data is below: <br>**
+- **Added a new column "id "which will denote whether the flight is originated from Pittsburgh (id = 2) or flight arrived in Pittsburgh (id = 1).**
+- **Self join the data by TailNum and FlightNum**
+- **Select the columns 1 to 30 which have the predictors i.e. the variables for origin to Pittsburgh and DepDelay.y and DepDel15.y which are the variables for Pittsburgh to destination.**
+- **Thus, DepDel15.y can be predicting using all other variables using our various models below.**
+
+# 6. Variable Selection and Regularization using Lasso
+```{r, cache=TRUE}
+
+flight.delay.lasso <- flight.delay.final
+
+# Converting factor variables to numeric  
+flight.delay.lasso$UniqueCarrier <- as.numeric(flight.delay.final$UniqueCarrier)
+flight.delay.lasso$FlightDate <- as.numeric(flight.delay.final$FlightDate)
+flight.delay.lasso$CancellationCode <- as.numeric(flight.delay.final$CancellationCode)
+flight.delay.lasso$Origin <- as.numeric(flight.delay.final$Origin)
+flight.delay.lasso$Dest <- as.numeric(flight.delay.final$Dest)
+flight.delay.lasso$TailNum <- as.numeric(flight.delay.final$TailNum)
+flight.delay.lasso <- select(flight.delay.lasso, -DepDelay.y)
+
+# Extract covariates matrix (for lasso)
+flight.delay.lasso.x <- as.matrix(flight.delay.lasso[, -which(names(flight.delay.lasso) == "DepDel15.y")])
+
+# Extract response variable (for lasso)
+flight.delay.lasso.y <- flight.delay.lasso$DepDel15.y
+ 
+# Fitting the model
+flight.delay.lasso.fit <- glmnet(x = flight.delay.lasso.x, y = flight.delay.lasso.y)
+
+# Regularization plot
+plot(flight.delay.lasso.fit, xvar = "norm", label = TRUE)
+
+```
+
+
+- **We fit the lasso model on the feature engineered data. The following results are observed: </br>**
+**- There are `r length(flight.delay.lasso.fit$lambda)` lambda value for the model fits. </br>**
+**- The above regularization plot shows that as more variables are added to the model, the computation will get more complex.**
+
+```{r, cache=TRUE}
+# Perform 10-fold cross validation
+flight.delay.lasso.fit.cv <- cv.glmnet(x = flight.delay.lasso.x, y = flight.delay.lasso.y)
+
+# To get CV error plot
+plot(flight.delay.lasso.fit.cv)
+
+```
+
+
+- **The above plot is the CV error plot.**
+
+
+```{r, cache=TRUE}
+
+# Value of lambda that gives min CV error
+lambda.min <- flight.delay.lasso.fit.cv$lambda.min
+
+# Value of lambda 1-SE rule tells to use
+lambda.1se <- flight.delay.lasso.fit.cv$lambda.1se
+
+# Number of non-zero variables in min-CV rule
+length(coef(flight.delay.lasso.fit.cv, s = flight.delay.lasso.fit.cv$lambda.min)[which(coef(flight.delay.lasso.fit.cv, s = "lambda.min") != 0)])
+
+# Number of non-zero variables in 1-SE rule
+length(coef(flight.delay.lasso.fit.cv, s = flight.delay.lasso.fit.cv$lambda.1se)[which(coef(flight.delay.lasso.fit.cv, s = "lambda.1se") != 0)])
+
+#Estimated CV error for  min-CV rule
+flight.delay.lasso.fit.cv$cvm[flight.delay.lasso.fit.cv$lambda == flight.delay.lasso.fit.cv$lambda.min]
+
+#Estimated CV error for  1-SE rule
+flight.delay.lasso.fit.cv$cvm[flight.delay.lasso.fit.cv$lambda == flight.delay.lasso.fit.cv$lambda.1se]
+
+# Coefficients of 1-SE
+coef(flight.delay.lasso.fit.cv, s = lambda.1se)
+
+```
+
+- **The value of $\lambda$ that minimizes CV error is `r lambda.min`. **
+- **The 1-SE rule tells us to use $\lambda$ value of `r lambda.1se`. `r length(coef(flight.delay.lasso.fit.cv, s = flight.delay.lasso.fit.cv$lambda.min)[which(coef(flight.delay.lasso.fit.cv, s = "lambda.min") != 0)])` non-zero variables are selected by the min-CV rule and `r length(coef(flight.delay.lasso.fit.cv, s = flight.delay.lasso.fit.cv$lambda.1se)[which(coef(flight.delay.lasso.fit.cv, s = "lambda.1se") != 0)])` non-zero variables by the 1-SE rule. The estimated CV error for min-CV model is `r flight.delay.lasso.fit.cv$cvm[flight.delay.lasso.fit.cv$lambda == flight.delay.lasso.fit.cv$lambda.min]` and that of 1-SE rule is `r flight.delay.lasso.fit.cv$cvm[flight.delay.lasso.fit.cv$lambda == flight.delay.lasso.fit.cv$lambda.1se]`.**
+
+
+```{r}
+
+#Function to generate performance metrics
+
+classMetrics <- function(score, y, cutoff, 
+                         type = c("all", "accuracy", "sensitivity", 
+                                  "specificity", "ppv", "npv", "precision", 
+                                  "recall")) {
+  # This command throws an error if the user specifies a "type" that
+  # isn't supported by this function
+  type <- match.arg(type, several.ok = TRUE)
+  
+  #Calc confusion matrix and other values
+conf.matrix <- table(predicted = factor(ifelse(score > cutoff, 1, 0), levels = c(0,1)), observed = y)
+accuracy <- sum(diag(conf.matrix))/length(score)
+sensitivity <- diag(conf.matrix)[2]/colSums(conf.matrix)[2]
+specificity <- diag(conf.matrix)[1]/colSums(conf.matrix)[1]
+ppv <-  diag(conf.matrix)[2]/rowSums(conf.matrix)[2]
+npv <-  diag(conf.matrix)[1]/rowSums(conf.matrix)[1]
+precision <- ppv
+recall <- sensitivity
+
+if('all' %in% type){
+  attributes <- matrix(nrow = 7, ncol=1)
+
+  rownames(attributes) <- c("accuracy", "sensitivity","specificity", "ppv", "npv", "precision", "recall")
+  colnames(attributes) <- "value"
+  attributes[1,1] <- accuracy
+  attributes[2,1] <- sensitivity
+  attributes[3,1] <- specificity
+  attributes[4,1] <- ppv
+  attributes[5,1] <- npv
+  attributes[6,1] <- precision
+  attributes[7,1] <- recall
+}
+else {
+  
+  attributes <- matrix(nrow = length(type), ncol=1)
+
+  rownames(attributes) <- type
+  colnames(attributes) <- "value"
+
+  for(i in 1:length(type)){
+  if(rownames(attributes)[i] =="accuracy")
+     attributes[i,1] <- accuracy
+  if(rownames(attributes)[i] =="sensitivity")
+     attributes[i,1] <- sensitivity
+  if(rownames(attributes)[i] =="specificity")
+     attributes[i,1] <- specificity
+  if(rownames(attributes)[i] =="ppv")
+     attributes[i,1] <- ppv
+  if(rownames(attributes)[i] =="npv")
+     attributes[i,1] <- npv
+  if(rownames(attributes)[i] =="precision")
+     attributes[i,1] <- precision
+  if(rownames(attributes)[i] =="recall")
+     attributes[i,1] <- recall
+  }
+   
+}
+
+result <- list(conf.mat = conf.matrix, perf = attributes)
+return (result)
+}
+```
+
+# 7. Logistic Regression Model
+```{r, cache=TRUE}
+
+#sample data 
+logReg <- flight.delay.final[sample(nrow(flight.delay.final)), ]
+
+#Remove variables which are not relevant for prediction
+logReg <- logReg %>% dplyr :: select(-c(FlightDate,TailNum,id,ArrTime,ArrDelay,CRSArrTime,DistanceGroup,CancellationCode,DepDel15,Dest, DepDelay.y))
+
+#convert to factor
+logReg$UniqueCarrier<- as.numeric(logReg$UniqueCarrier)
+logReg$Origin <- as.numeric(logReg$Origin)
+
+#Validated logistic model with Cross Validation
+# Number of iterations
+k <- 10
+acc <- NULL
+set.seed(123)
+folds <- cut(seq(1,nrow(logReg)),breaks=k,labels=FALSE)
+
+for(i in 1:k)
+{
+# Train-test splitting
+# 90% of samples -> fitting
+# 10% of samples -> testing
+      test.indexes <- which(folds==i,arr.ind=TRUE)
+      test.data <- logReg[test.indexes, ]
+      train.data <- logReg[-test.indexes, ]
+  
+# Fitting
+flight.logit <- glm(DepDel15.y~.,family=binomial,data=train.data)
+
+# Predict results
+results_prob <- predict(flight.logit, newdata = test.data ,type ="response")
+
+# If prob > 0.5 then 1, else 0
+results <- ifelse(results_prob > 0.5,1,0)
+
+# Actual answers
+answers <- test.data$DepDel15
+
+# Accuracy calculation
+misClasificError <- mean(answers != results)
+
+# Collecting results
+acc[i] <- 1-misClasificError
+}
+
+# Average accuracy of the model
+mean(acc)
+par(mfcol=c(1,2))
+
+# Histogram of accuracy
+hist(acc,xlab='Accuracy',ylab='Freq',
+col='cyan',border='blue',density=30)
+
+# Boxplot of accuracy
+boxplot(acc,col='cyan',border='blue',horizontal=T,xlab='Accuracy',
+main='Accuracy CV')
+
+```
+
+- **Fitting the model using Logistic Regression with Cross Validation: We fit a logistic regression model using some selected variables relevant for prediction of departure delay from Pittsburgh. We then cross validated the the model using a 10-fold Cross validation. The mean accuracy for each fold is predicted at 0.5 cutoff and mean of accuracy is calculated. Mean accuracy at this cutoff comes at around 82%.**
+
+# 8. Random Forest Modelling
+```{r, cache=TRUE}
+
+# Changing factor variables to numeric
+flight.delay.final$UniqueCarrier<- as.numeric(flight.delay.final$UniqueCarrier)
+flight.delay.final$Origin <- as.numeric(flight.delay.final$Origin)
+flight.delay.final$Dest <- as.numeric(flight.delay.final$Dest)
+
+flight.delay.rf <- flight.delay.final
+
+flight.delay.rf$DayOfWeek <- as.factor(gsub("1", "MON", flight.delay.rf$DayOfWeek ))
+flight.delay.rf$DayOfWeek <- as.factor(gsub("2", "TUE", flight.delay.rf$DayOfWeek ))
+flight.delay.rf$DayOfWeek <- as.factor(gsub("3", "WED", flight.delay.rf$DayOfWeek ))
+flight.delay.rf$DayOfWeek <- as.factor(gsub("4", "THU", flight.delay.rf$DayOfWeek ))
+flight.delay.rf$DayOfWeek <- as.factor(gsub("5", "FRI", flight.delay.rf$DayOfWeek ))
+flight.delay.rf$DayOfWeek <- as.factor(gsub("6", "SAT", flight.delay.rf$DayOfWeek ))
+flight.delay.rf$DayOfWeek <- as.factor(gsub("7", "SUN", flight.delay.rf$DayOfWeek ))
+
+flight.delay.rf$DepDel15.y <- as.factor(gsub("1", "moreThan15(min)", flight.delay.rf$DepDel15.y ))
+flight.delay.rf$DepDel15.y <- as.factor(gsub("0", "lessThan15(min)", flight.delay.rf$DepDel15.y ))
+
+# 70% of the sample size
+smp_size <- floor(0.70 * nrow(flight.delay.rf))
+
+# set the seed to make your partition reproductible
+set.seed(12345)
+train_ind <- sample(seq_len(nrow(flight.delay.rf)), size = smp_size)
+
+rfd.train <- flight.delay.rf[train_ind, ]
+rfd.test <- flight.delay.rf[-train_ind, ]
+
+rfd.rf <- randomForest(rfd.train$DepDel15.y ~ . -FlightDate -CancellationCode -TailNum -DepDel15.y -DepDelay.y -id - ArrTime -ArrDelay -CRSArrTime -DistanceGroup, data = rfd.train, importance=TRUE, mtry=3)
+
+varImpPlot(rfd.rf)
+
+preds.random <- data.frame(predict(rfd.rf, newdata = rfd.test, type = 'prob'))
+
+classMetrics(preds.random$moreThan15.min. , rfd.test$DepDel15.y , cutoff = 0.17, type = "all")
+
+roc.rfd <- roc(rfd.test$DepDel15.y, preds.random$moreThan15.min.)
+
+plot(roc.rfd, col= "steelblue", main = "ROC Curve for Random forest")
+
+roc.rfd$auc
+
+```
+
+
+**Random Forest Model </br>**
+- **A random forest is modelled taking DepDel15.y i.e the DepDel15 for Pittsburgh to other cities as response variable and other variables except Arrival attributes like ArrTime, FlightDate, TailNum and id because these were not helping in any interpretation.**
+- **We are predicting with cutoff 0.17. We have taken the cutoff as 0.17 because in our problem we are very much concerned about sensitivity since False Negatives are too costly and hence, we correctly need to predict the true flights getting delayed.**
+
+
+**Random Forest Interpretation: </br>**
+
+- **Importance plot : The importance plot shows that DepDelay which is the delay from the origin airport to Pittsburgh, CRSDepTime which is the scheduled departure time from origin to Pittsburgh, and DepTime which is the actual Departure time from Origin to Pittsburgh. This shows that the more the time of leaving from origin the more is the delay from Pittsburgh. For example, if the flight is leaving at night from origin then there would be more delay from Pittsburgh may be because there is more conjestion during night. The next important variable TaxiOut is also affecting the model because it is the time taken by a flight to reach the runway from its original position. This shows that flights from Pittsburgh are getting delayed because it takes more time for flights to reach the runway may be due to small airport causing conjestion at the airport. The other factors of delay like CarrierDelay, NASDelay, LateAircraftDelay and DepDel15 shows that the flights are getting delayed because the aircraft reached late at the origin airport. </br>**
+
+- **For 2006 test data, the classification matrix is showing that our True Positives are 1769 and our False Negatives are 840. Our performance metrics shows a senstivity of 67% which is fairly good and it is correctly predicting 67% of the delayed flights. The accuracy of the model is 85% which is also good.**
+
+
+# 9. Validation of Random Forest Model using 2016 Pittsburgh Flight Delay data.
+## Feature Engineering
+```{r, warning=FALSE}
+
+# Change this path to your local drive where you have store the file.
+setwd("/Users/priyankakaria/Documents/CMU/Fall/Mini-2/Data Mining/Project/")
+
+flight.delay.2016 <- read.csv("all_PIT_2016.csv",header = TRUE, sep = ",")
+
+flight.delay.2016 <- flight.delay.2016 %>%dplyr :: select(-c(AirlineID, Carrier, Flights, ArrDel15, DepTimeBlk, OriginCityName, OriginStateFips, OriginStateName, OriginState, DestCityName, DestState, DestStateFips, DestStateName, DestWac, WheelsOff, WheelsOn, Year, Quarter, DayofMonth, OriginWac, Cancelled))
+
+flight.delay.2016 <- arrange(flight.delay.2016, FlightDate, TailNum, FlightNum)
+
+flight.delay.pit.2016 <- flight.delay.2016 %>% mutate(id = ifelse(Origin=="PIT", 2, 1))
+flight.delay.pit.2016 <- arrange(flight.delay.pit.2016, FlightDate, TailNum, Origin, Dest, id, DepDelay)
+
+flight.delay.pit.2016.1 <- subset(flight.delay.pit.2016, flight.delay.pit.2016$id == 1)
+
+flight.delay.pit.2016.2 <- subset(flight.delay.pit.2016, flight.delay.pit.2016$id == 2)
+
+flight.combine.data.2016 <- left_join (flight.delay.pit.2016.1, flight.delay.pit.2016.2, by = c("TailNum","FlightDate"))
+
+#Combining Data
+flight.combine.data.2016 <- select(flight.combine.data.2016, 1:30, DepDelay.y, DepDel15.y )
+
+#Renaming columns
+names(flight.combine.data.2016) <- sub(".x$", "", names(flight.combine.data.2016))
+
+flight.delay.2016 <- flight.combine.data.2016
+
+```
+
+
+## Filling missing data and prediction
+```{r}
+#Filling ActualElapsedTime with CRSElapsedTime
+flight.delay.2016$ActualElapsedTime <- ifelse(is.na(flight.delay.2016$ActualElapsedTime) == "TRUE", flight.delay.2016$CRSElapsedTime, flight.delay.2016$ActualElapsedTime)
+
+#Removing observations where ActualElapsedTime is missing
+flight.delay.2016 <- subset(flight.delay.2016, is.na(flight.delay.2016$ActualElapsedTime)==FALSE)
+
+#Filling ArrTime with CRSArrTime
+flight.delay.2016$ArrTime <- ifelse(is.na(flight.delay.2016$ArrTime) == "TRUE", flight.delay.2016$CRSArrTime, flight.delay.2016$ArrTime)
+
+#Filling DepTime with CRSDepTime
+flight.delay.2016$DepTime <- ifelse(is.na(flight.delay.2016$DepTime) == "TRUE", flight.delay.2016$CRSDepTime, flight.delay.2016$DepTime)
+
+#Filling ArrDelay with 0
+flight.delay.2016$ArrDelay <- ifelse(is.na(flight.delay.2016$ArrDelay) == "TRUE", 0, flight.delay.2016$ArrDelay)
+
+#Filling DepDelay with 0
+flight.delay.2016$DepDelay <- ifelse(is.na(flight.delay.2016$DepDelay) == "TRUE", 0, flight.delay.2016$DepDelay)
+
+#Filling AirTime with 0
+flight.delay.2016$AirTime <- ifelse(is.na(flight.delay.2016$AirTime) == "TRUE",0,flight.delay.2016$AirTime)
+
+#Filling DepDel15 with 0
+flight.delay.2016$DepDel15 <- ifelse(is.na(flight.delay.2016$DepDel15) == "TRUE", 0, flight.delay.2016$DepDel15)
+                                      
+#Filling CarrierDelay with 0
+flight.delay.2016$CarrierDelay <- ifelse(is.na(flight.delay.2016$CarrierDelay) == "TRUE", 0, flight.delay.2016$CarrierDelay)
+                                      
+#Filling WeatherDelay with 0
+flight.delay.2016$WeatherDelay <- ifelse(is.na(flight.delay.2016$WeatherDelay) == "TRUE", 0, flight.delay.2016$WeatherDelay)
+                                      
+#Filling NASDelay with 0
+flight.delay.2016$NASDelay <- ifelse(is.na(flight.delay.2016$NASDelay) == "TRUE", 0, flight.delay.2016$NASDelay)
+                                      
+#Filling SecurityDelay with 0
+flight.delay.2016$SecurityDelay <- ifelse(is.na(flight.delay.2016$SecurityDelay) == "TRUE", 0, flight.delay.2016$SecurityDelay)
+                                      
+#Filling LateAircraftDelay with 0
+flight.delay.2016$LateAircraftDelay <- ifelse(is.na(flight.delay.2016$LateAircraftDelay) == "TRUE", 0, flight.delay.2016$LateAircraftDelay)
+
+#Filling CancellationCode with 0
+flight.delay.2016$CancellationCode <- ifelse(is.na(flight.delay.2016$CancellationCode) == "TRUE", 0, flight.delay.2016$CancellationCode)
+
+#Filling TaxiIn with 0
+flight.delay.2016$TaxiIn <- ifelse(is.na(flight.delay.2016$TaxiIn) == "TRUE", 0, flight.delay.2016$TaxiIn)
+
+#Filling TaxiOut with 0
+flight.delay.2016$TaxiOut <- ifelse(is.na(flight.delay.2016$TaxiOut) == "TRUE", 0, flight.delay.2016$TaxiOut)
+
+#Filling DepDel15 with 0
+flight.delay.2016$DepDel15.y <- ifelse(is.na(flight.delay.2016$DepDel15.y) == "TRUE",0,flight.delay.2016$DepDel15.y)
+flight.delay.2016$DepDelay.y <- ifelse(is.na(flight.delay.2016$DepDelay.y) == "TRUE",0,flight.delay.2016$DepDelay.y)
+
+#Converting delays to positive values
+flight.delay.2016$ArrDelay <- ifelse(flight.delay.2016$ArrDelay < 0, 0, flight.delay.2016$ArrDelay)
+flight.delay.2016$DepDelay <- ifelse(flight.delay.2016$DepDelay < 0, 0, flight.delay.2016$DepDelay)
+flight.delay.2016$DepDelay.y <- ifelse(flight.delay.2016$DepDelay.y < 0, 0, flight.delay.2016$DepDelay.y)
+
+flight.delay.2016$DayOfWeek <- as.factor(gsub("1", "MON", flight.delay.2016$DayOfWeek ))
+flight.delay.2016$DayOfWeek <- as.factor(gsub("2", "TUE", flight.delay.2016$DayOfWeek ))
+flight.delay.2016$DayOfWeek <- as.factor(gsub("3", "WED", flight.delay.2016$DayOfWeek ))
+flight.delay.2016$DayOfWeek <- as.factor(gsub("4", "THU", flight.delay.2016$DayOfWeek ))
+flight.delay.2016$DayOfWeek <- as.factor(gsub("5", "FRI", flight.delay.2016$DayOfWeek ))
+flight.delay.2016$DayOfWeek <- as.factor(gsub("6", "SAT", flight.delay.2016$DayOfWeek ))
+flight.delay.2016$DayOfWeek <- as.factor(gsub("7", "SUN", flight.delay.2016$DayOfWeek ))
+
+flight.delay.2016$DepDel15.y <- as.factor(gsub("1", "moreThan15(min)", flight.delay.2016$DepDel15.y ))
+flight.delay.2016$DepDel15.y <- as.factor(gsub("0", "lessThan15(min)", flight.delay.2016$DepDel15.y ))
+
+flight.delay.2016$UniqueCarrier<- as.numeric(flight.delay.2016$UniqueCarrier)
+flight.delay.2016$Origin <- as.numeric(flight.delay.2016$Origin)
+flight.delay.2016$Dest <- as.numeric(flight.delay.2016$Dest)
+
+
+preds.random <- data.frame(predict(rfd.rf, newdata = flight.delay.2016, type = 'prob'))
+
+classMetrics(preds.random$moreThan15.min. , flight.delay.2016$DepDel15 , cutoff = 0.17, type = "all")
+```
+
+
+- **For 2016 validation data, the classification matrix is showing that our True Positives are 3467 and our False Negatives are 1106. Our performance metrics shows a senstivity of 75.8% which is fairly good and better than test data of 2006 and it is correctly predicting 75.8% of the delayed flights. The accuracy of the model is 76% which is not better than the test data but fairly good.**
+
+- **The AUC for test data (2006) is 86% which shows that for 86% of the times, this random forest model will rank the flights going to be delayed above the flights which are not going to be delayed.**
+
+- **Conclusion: Random forest is fairly performing good and correctly predicting maximum flights delayed which is better for 2016 data. This shows that the model is a better predictor in 2016. This is because PIT airport was a hub in 2006 due to which it was getting more traffic and hence more delays. Now, the PIT airport is not a Hub due to which there are less number of delayed flights and more number getting predicted correctly. This model can be used to send messages to passengers about the delay in their flight. The ROC curve shows a good senstivity versus specificity. Our model can be improved by having attributes related to airport status like how conjested is the airport on a particular day or the number of working on the airport on that day.**
+
+#10. Comparing with 2016 Data 
+```{r. warning=FALSE}
+
+setwd("/Users/priyankakaria/Documents/CMU/Fall/Mini-2/Data Mining/Project/")
+
+flight.delay.2016 <- read.csv("all_PIT_2016.csv",header = TRUE, sep = ",")
+
+flight.delay.2016 <- flight.delay.2016 %>%dplyr :: select(-c(AirlineID, Carrier, Flights, ArrDel15, DepTimeBlk, OriginCityName, OriginStateFips, OriginStateName, OriginState, DestCityName, DestState, DestStateFips, DestStateName, DestWac, WheelsOff, WheelsOn, Year, Quarter, DayofMonth, OriginWac, Cancelled))
+
+kable(field.summary(flight.delay.2016))
+```
+
+
+** As we can see in the summary, in 2016, average departure delay reduce from PIT aiport implying that the airport is performing well these days. **
+
+**In conclusion, flight departure delay at PIT airport can be fairly predicted using a random forest model. Since PIT airport has most of the flights coming in from different cities and so the delay in departure is highly based on delay by which the particular aircraft comes to PIT which is predicted in our model by Departure Delay from origin where the aircraft is coming from.**
